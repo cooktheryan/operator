@@ -126,7 +126,7 @@ fn build_filter_chain(
     if scoped_refs.is_empty() {
         filters.push(PraxisFilterEntry {
             filter: "static_response".to_owned(),
-            config: yaml_serde::to_value(serde_json::json!({"status": 404}))?,
+            config: yaml_serde::to_value(serde_json::json!({"status": 404, "body": "no route"}))?,
         });
         return Ok(PraxisFilterChain {
             name: format!("{name}-chain"),

@@ -2211,3 +2211,176 @@ async fn await_echo_response(client: &reqwest::Client, url: &str, timeout_secs: 
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 }
+
+// Run this test with PRAXIS_MONITORING_ENABLED matching the operator Deployment.
+// Exercise disabled mode before installing the PodMonitor CRD, enabled mode after
+// installing it, and disabled mode again to cover stale-resource cleanup.
+#[cfg(test)]
+mod monitoring_tests {
+    use k8s_openapi::api::networking::v1::NetworkPolicy;
+    use kube::{
+        ResourceExt as _,
+        api::{DynamicObject, Patch, PatchParams},
+    };
+    use praxis_operator::resources::monitoring::{
+        MonitoringConfig, build_metrics_network_policy, build_pod_monitor, monitoring_config, pod_monitor_api_resource,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn monitoring_reconciliation() {
+        let ctx = TestContext::new().await;
+        let config = monitoring_config().expect("valid monitoring environment");
+        let gc = ctx.create_gateway_class("monitoring-gc").await;
+        ctx.await_cluster_condition::<GatewayClass>(&gc, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+            .await;
+        let ns = ctx.create_test_namespace("monitoring").await;
+        let name = ctx.create_gateway("monitoring", &ns, &gc, 8080).await;
+        ctx.await_gateway_condition(&name, &ns, "Accepted", "True", RECONCILE_TIMEOUT_SECS)
+            .await;
+        let child = format!("praxis-{name}");
+        let deployments = Api::<Deployment>::namespaced(ctx.client.clone(), &ns);
+        await_deployment_ready(&deployments, &child, DATA_PLANE_TIMEOUT_SECS).await;
+        let gateways = Api::<Gateway>::namespaced(ctx.client.clone(), &ns);
+        let gw = gateways.get(&name).await.unwrap();
+        let policies = Api::<NetworkPolicy>::namespaced(ctx.client.clone(), &ns);
+        let monitors = Api::<DynamicObject>::namespaced_with(ctx.client.clone(), &ns, &pod_monitor_api_resource());
+        if let Some(config) = config {
+            let (policy, monitor) = await_monitoring_present(&policies, &monitors, &child).await;
+            assert_eq!(
+                policy,
+                build_metrics_network_policy(&child, &ns, &gw, &config, &[("http".to_owned(), 8080)])
+                    .map(|mut expected| {
+                        expected.metadata = policy.metadata.clone();
+                        expected
+                    })
+                    .unwrap(),
+                "the API stores the intended policy"
+            );
+            assert_eq!(
+                monitor.data,
+                build_pod_monitor(&child, &ns, &gw).unwrap().data,
+                "the API stores the intended monitor spec"
+            );
+            let pods = Api::<Pod>::namespaced(ctx.client.clone(), &ns)
+                .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={name}")))
+                .await
+                .unwrap();
+            let pod_name = pods.items.first().expect("proxy pod").name_any();
+            let request = http::Request::get(format!("/api/v1/namespaces/{ns}/pods/{pod_name}:8080/proxy/"))
+                .body(kube::client::Body::empty())
+                .unwrap();
+            let response = ctx.client.send(request).await.expect("reach routeless proxy");
+            assert_eq!(
+                response.status(),
+                http::StatusCode::NOT_FOUND,
+                "routeless published proxy returns HTTP 404"
+            );
+            gateways
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(
+                        serde_json::json!({"spec":{"listeners":[{"name":"http","port":9902,"protocol":"HTTP"}]}}),
+                    ),
+                )
+                .await
+                .unwrap();
+            await_monitoring_absent(&policies, &monitors, &child).await;
+            gateways
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(
+                        serde_json::json!({"spec":{"listeners":[{"name":"http","port":8080,"protocol":"HTTP"}]}}),
+                    ),
+                )
+                .await
+                .unwrap();
+            await_monitoring_present(&policies, &monitors, &child).await;
+        } else {
+            let crds = Api::<
+                k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+            >::all(ctx.client.clone());
+            let has_crd = crds
+                .get_opt("podmonitors.monitoring.coreos.com")
+                .await
+                .unwrap()
+                .is_some();
+            let stale_config = MonitoringConfig {
+                namespace: "monitoring".to_owned(),
+                pod_selector: std::collections::BTreeMap::from([("app".to_owned(), "prometheus".to_owned())]),
+            };
+            let policy =
+                build_metrics_network_policy(&child, &ns, &gw, &stale_config, &[("http".to_owned(), 8080)]).unwrap();
+            policies
+                .patch(&child, &PatchParams::apply("monitoring-test"), &Patch::Apply(&policy))
+                .await
+                .unwrap();
+            if has_crd {
+                let monitor = build_pod_monitor(&child, &ns, &gw).unwrap();
+                monitors
+                    .patch(&child, &PatchParams::apply("monitoring-test"), &Patch::Apply(&monitor))
+                    .await
+                    .unwrap();
+            }
+            gateways.patch(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({"metadata":{"annotations":{"test.praxis.sh/reconcile":"monitoring-cleanup"}}}))).await.unwrap();
+            await_monitoring_absent(&policies, &monitors, &child).await;
+            assert!(
+                deployments.get_opt(&child).await.unwrap().is_some(),
+                "disabled monitoring does not prevent data-plane reconciliation without the CRD"
+            );
+        }
+        ctx.cleanup_gateway(&name, &ns).await;
+        ctx.cleanup_gateway_class(&gc).await;
+        ctx.cleanup_namespace(&ns).await;
+    }
+
+    async fn await_monitoring_absent(policies: &Api<NetworkPolicy>, monitors: &Api<DynamicObject>, name: &str) {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(RECONCILE_TIMEOUT_SECS))
+            .expect("test deadline fits the clock");
+        loop {
+            if policies.get_opt(name).await.unwrap().is_none() && monitor_is_absent(monitors, name).await {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owned monitoring resources must be reclaimed"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    }
+    async fn await_monitoring_present(
+        policies: &Api<NetworkPolicy>,
+        monitors: &Api<DynamicObject>,
+        name: &str,
+    ) -> (NetworkPolicy, DynamicObject) {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(RECONCILE_TIMEOUT_SECS))
+            .expect("test deadline fits the clock");
+        loop {
+            if let (Some(policy), Some(monitor)) = (
+                policies.get_opt(name).await.unwrap(),
+                monitors.get_opt(name).await.unwrap(),
+            ) {
+                return (policy, monitor);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "enabled monitoring must reconcile both resources"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    async fn monitor_is_absent(monitors: &Api<DynamicObject>, name: &str) -> bool {
+        match monitors.get(name).await {
+            Ok(_) => false,
+            Err(kube::Error::Api(status)) if status.code == 404 => true,
+            Err(error) => panic!("unexpected PodMonitor API failure: {error}"),
+        }
+    }
+}

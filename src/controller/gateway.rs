@@ -8,7 +8,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use gateway_api::{gateways::Gateway, httproutes::HTTPRoute, referencegrants::ReferenceGrant};
 use kube::{
     Api, Resource, ResourceExt as _,
-    api::{Patch, PatchParams},
+    api::{ApiResource, DynamicObject, Patch, PatchParams},
     runtime::{
         controller::Action,
         events::{Event, EventType},
@@ -82,7 +82,8 @@ pub fn error_policy(_gw: Arc<Gateway>, error: &OperatorError, _ctx: Arc<Context>
         | OperatorError::LeadershipLost
         | OperatorError::CacheSync(_)
         | OperatorError::Serialization(_)
-        | OperatorError::YamlSerialization(_) => Duration::from_secs(30),
+        | OperatorError::YamlSerialization(_)
+        | OperatorError::InvalidMonitoringSelector => Duration::from_secs(30),
     };
     error!(
         %error, "Gateway reconciliation failed, retrying in {delay:?}"
@@ -307,6 +308,29 @@ where
     )
     .await?;
     debug!("applied {name}");
+    Ok(())
+}
+
+/// Applies a namespaced dynamic resource via server-side apply.
+pub(super) async fn apply_dynamic_resource(
+    client: &kube::Client,
+    ns: &str,
+    resource: &DynamicObject,
+    api_resource: &ApiResource,
+) -> Result<()> {
+    let api = Api::<DynamicObject>::namespaced_with(client.clone(), ns, api_resource);
+    let name = resource
+        .meta()
+        .name
+        .as_deref()
+        .ok_or(OperatorError::MissingObjectKey(".metadata.name"))?;
+    api.patch(
+        name,
+        &PatchParams::apply("praxis-operator").force(),
+        &Patch::Apply(resource),
+    )
+    .await?;
+    debug!(%name, kind = %api_resource.kind, "applied dynamic resource");
     Ok(())
 }
 

@@ -29,6 +29,37 @@ resources and recreates them when a usable listener is restored. Attached
 HTTPRoutes update their parent status when listeners move to or from the
 reserved port.
 
+### Optional monitoring resources
+
+Set `PRAXIS_MONITORING_ENABLED=true` to have the operator create a
+`PodMonitor` and a metrics-only `NetworkPolicy` for each managed data plane.
+The Prometheus Operator CRD must be installed before enabling this option;
+with the option unset or false, reconciliation tolerates an absent CRD and
+removes any owned monitoring resources left by an earlier enabled configuration.
+
+- **Default:** disabled
+- **Namespace:** `PRAXIS_MONITORING_NAMESPACE` (default `monitoring`)
+- **Prometheus selector:** `PRAXIS_MONITORING_POD_SELECTOR` as comma-separated
+  `key=value` labels (default `app.kubernetes.io/name=prometheus`). Malformed or
+  duplicate requirements cause a configuration error; no partial selector is applied.
+
+The generated policy allows only the selected Prometheus pods in the selected
+namespace to reach port 9902. It explicitly allows TCP traffic to every configured
+data listener port from any source; Kubernetes combines these allowances with
+other policies additively. If the
+cluster's CNI applies NetworkPolicy to node-originated kubelet probes, add the
+cluster's node CIDRs in a separate policy overlay.
+
+```yaml
+env:
+  - name: PRAXIS_MONITORING_ENABLED
+    value: "true"
+  - name: PRAXIS_MONITORING_NAMESPACE
+    value: observability
+  - name: PRAXIS_MONITORING_POD_SELECTOR
+    value: "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=main"
+```
+
 ### `RUST_LOG`
 
 Controls operator log verbosity using the standard
@@ -68,6 +99,18 @@ permissions:
 | configmaps  | get, list, watch, create, update, patch, delete |
 | secrets     | get, list, watch, create, update, patch, delete |
 | events      | create, patch                             |
+
+### Networking Resources
+
+| API group | Resource | Verbs |
+|-----------|----------|-------|
+| networking.k8s.io | networkpolicies | get, list, watch, create, update, patch, delete |
+
+### Monitoring Operator Resources
+
+| API group | Resource | Verbs |
+|-----------|----------|-------|
+| monitoring.coreos.com | podmonitors | get, list, watch, create, update, patch, delete |
 
 ### Discovery Resources
 

@@ -9,17 +9,18 @@ use gateway_api::gateways::Gateway;
 use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{ConfigMap, Service},
+    networking::v1::NetworkPolicy,
     policy::v1::PodDisruptionBudget,
 };
 use kube::{
     Api, Resource, ResourceExt as _,
-    api::{DeleteParams, Preconditions},
+    api::{DeleteParams, DynamicObject, Preconditions},
 };
 use serde::de::DeserializeOwned;
 
 use crate::{
     error::{OperatorError, Result},
-    resources::labels::child_name,
+    resources::{labels::child_name, monitoring::pod_monitor_api_resource},
 };
 
 /// Removes only children controlled by this Gateway, tolerating prior deletion.
@@ -30,7 +31,18 @@ pub(super) async fn delete_children(client: &kube::Client, gw: &Gateway) -> Resu
     delete_owned::<Service>(client, &namespace, &name, &owner_uid).await?;
     Box::pin(delete_owned::<Deployment>(client, &namespace, &name, &owner_uid)).await?;
     delete_owned::<ConfigMap>(client, &namespace, &name, &owner_uid).await?;
-    delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await
+    delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await?;
+    delete_monitoring_children(client, gw).await
+}
+
+/// Removes monitoring resources regardless of the current enablement setting.
+pub(super) async fn delete_monitoring_children(client: &kube::Client, gw: &Gateway) -> Result<()> {
+    let namespace = gw.namespace().unwrap_or_default();
+    let name = child_name(&gw.name_any());
+    let owner_uid = gw.uid().ok_or(OperatorError::MissingObjectKey(".metadata.uid"))?;
+    delete_owned::<NetworkPolicy>(client, &namespace, &name, &owner_uid).await?;
+    let monitors = Api::<DynamicObject>::namespaced_with(client.clone(), &namespace, &pod_monitor_api_resource());
+    delete_from_api(&monitors, &name, &owner_uid).await
 }
 
 /// Checks controller ownership and guards deletion against concurrent replacement.
@@ -40,7 +52,16 @@ where
     <K as Resource>::DynamicType: Default,
 {
     let api = Api::<K>::namespaced(client.clone(), namespace);
-    let Some(child) = api.get_opt(name).await? else {
+    delete_from_api(&api, name, owner_uid).await
+}
+
+/// Uses the same ownership and concurrency guards for static and dynamic kinds.
+/// A missing object or absent optional CRD both return 404 and need no deletion.
+async fn delete_from_api<K>(api: &Api<K>, name: &str, owner_uid: &str) -> Result<()>
+where
+    K: Resource + DeserializeOwned + Clone + Debug,
+{
+    let Some(child) = ignore_not_found(api.get(name).await)? else {
         return Ok(());
     };
     if !child
@@ -57,9 +78,14 @@ where
         }),
         ..DeleteParams::default()
     };
-    match api.delete(name, &params).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+    ignore_not_found(api.delete(name, &params).await).map(|_| ())
+}
+
+/// Treats any API 404 as absent, including API groups returning plain-text errors.
+fn ignore_not_found<T>(response: std::result::Result<T, kube::Error>) -> Result<Option<T>> {
+    match response {
+        Ok(value) => Ok(Some(value)),
+        Err(kube::Error::Api(status)) if status.code == 404 => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -135,6 +161,61 @@ mod tests {
                 .await
                 .is_err(),
             "cleanup failures must be retried instead of reporting stale resources removed"
+        );
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "explicit monitoring fixtures cover policy and reconciliation contracts"
+    )]
+    async fn monitoring_cleanup_obeys_ownership_and_tolerates_absent_crd() {
+        for owner in ["gateway-uid", "foreign-uid"] {
+            let mut monitor = serde_json::json!({"apiVersion":"monitoring.coreos.com/v1", "kind":"PodMonitor", "metadata": {
+                "name":"praxis-gw", "namespace":"infra", "uid":"monitor-uid", "resourceVersion":"9",
+                "ownerReferences":[{"apiVersion":"gateway.networking.k8s.io/v1", "kind":"Gateway", "name":"gw", "uid":owner, "controller":true}]
+            }});
+            let mut policy = monitor.clone();
+            policy["apiVersion"] = "networking.k8s.io/v1".into();
+            policy["kind"] = "NetworkPolicy".into();
+            monitor["spec"] = serde_json::json!({});
+            let (ctx, journal) = testing::fake_context(
+                vec![
+                    testing::Canned::ok("/networkpolicies/praxis-gw", policy),
+                    testing::Canned::ok("/podmonitors/praxis-gw", monitor),
+                ],
+                testing::Cached::default(),
+            );
+            let gateway: Gateway = serde_json::from_value(serde_json::json!({"metadata":{"name":"gw","namespace":"infra","uid":"gateway-uid"},"spec":{"gatewayClassName":"praxis","listeners":[]}})).unwrap();
+            delete_monitoring_children(&ctx.client, &gateway).await.unwrap();
+            let deletes: Vec<_> = journal
+                .requests()
+                .into_iter()
+                .filter(|request| request.method == "DELETE")
+                .collect();
+            assert_eq!(
+                deletes.len(),
+                if owner == "gateway-uid" { 2 } else { 0 },
+                "only this Gateway's monitoring can be deleted"
+            );
+            for request in deletes {
+                assert_eq!(
+                    request.body.unwrap()["preconditions"]["resourceVersion"],
+                    "9",
+                    "deletion must guard replacement races"
+                );
+            }
+        }
+        let (ctx, _) = testing::fake_context(vec![], testing::Cached::default());
+        let monitors = Api::<DynamicObject>::namespaced_with(ctx.client.clone(), "infra", &pod_monitor_api_resource());
+        delete_from_api(&monitors, "praxis-gw", "gateway-uid").await.unwrap();
+    }
+    #[test]
+    fn absent_api_group_does_not_require_a_not_found_reason() {
+        let response: kube::core::Status = serde_json::from_value(json!({"status":"Failure", "code":404, "message":"404 page not found\n", "reason":"Failed to parse error data"})).unwrap();
+        assert_eq!(
+            ignore_not_found::<()>(Err(kube::Error::Api(Box::new(response)))).unwrap(),
+            None,
+            "absent API groups return unstructured 404 responses"
         );
     }
 }

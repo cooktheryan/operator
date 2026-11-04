@@ -39,6 +39,10 @@ use crate::{
         deployment::{DeploymentParams, build_deployment},
         disruption::build_pod_disruption_budget,
         labels::child_name,
+        monitoring::{
+            MonitoringConfig, build_metrics_network_policy, build_pod_monitor, monitoring_config,
+            pod_monitor_api_resource,
+        },
         service::build_service,
     },
 };
@@ -316,6 +320,7 @@ pub(super) async fn apply_child_resources(
     gw: &Gateway,
     config_output: &PraxisConfigOutput,
 ) -> Result<String> {
+    let monitoring = monitoring_config()?;
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     let child = child_name(&name);
@@ -341,7 +346,26 @@ pub(super) async fn apply_child_resources(
     let budget = build_pod_disruption_budget(&child, &ns, gw)?;
     super::gateway::apply_resource(client, &ns, &budget).await?;
 
+    reconcile_monitoring(client, gw, config_output, monitoring.as_ref()).await?;
     Ok(config_hash)
+}
+
+/// Applies enabled monitoring or removes only this Gateway's stale monitoring.
+async fn reconcile_monitoring(
+    client: &kube::Client,
+    gw: &Gateway,
+    config_output: &PraxisConfigOutput,
+    monitoring: Option<&MonitoringConfig>,
+) -> Result<()> {
+    let Some(config) = monitoring else {
+        return super::child_cleanup::delete_monitoring_children(client, gw).await;
+    };
+    let ns = gw.namespace().unwrap_or_default();
+    let child = child_name(&gw.name_any());
+    let monitor = build_pod_monitor(&child, &ns, gw)?;
+    super::gateway::apply_dynamic_resource(client, &ns, &monitor, &pod_monitor_api_resource()).await?;
+    let policy = build_metrics_network_policy(&child, &ns, gw, config, &config_output.listener_ports)?;
+    super::gateway::apply_resource(client, &ns, &policy).await
 }
 
 /// Hashes the parts of the generated config that require a Deployment rollout.
@@ -906,5 +930,63 @@ mod tests {
                 }],
             }),
         )
+    }
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "explicit monitoring fixtures cover policy and reconciliation contracts"
+    )]
+    async fn monitoring_apply_and_disabled_cleanup_use_real_reconciliation_paths() {
+        let output = test_config_output("listeners: []", vec![("http".to_owned(), 8080)], vec![], vec![]);
+        let (client, journal) = testing::fake_client(vec![
+            testing::Canned::ok(
+                "/networkpolicies",
+                serde_json::json!({"apiVersion":"networking.k8s.io/v1", "kind":"NetworkPolicy"}),
+            ),
+            testing::Canned::ok(
+                "/podmonitors",
+                serde_json::json!({"apiVersion":"monitoring.coreos.com/v1", "kind":"PodMonitor"}),
+            ),
+        ]);
+        let config = MonitoringConfig {
+            namespace: "monitoring".to_owned(),
+            pod_selector: BTreeMap::from([("app".to_owned(), "prometheus".to_owned())]),
+        };
+        reconcile_monitoring(&client, &gateway(), &output, Some(&config))
+            .await
+            .unwrap();
+        assert_eq!(
+            journal
+                .requests()
+                .iter()
+                .filter(|request| request.method == "PATCH")
+                .count(),
+            2,
+            "both enabled resources must be applied"
+        );
+        let (client, journal) = testing::fake_client(vec![]);
+        reconcile_monitoring(&client, &gateway(), &output, None).await.unwrap();
+        for kind in ["/networkpolicies/", "/podmonitors/"] {
+            assert!(
+                journal
+                    .requests()
+                    .iter()
+                    .any(|request| request.method == "GET" && request.uri.contains(kind)),
+                "disabled monitoring must look for stale owned resources: {kind}"
+            );
+        }
+        let (client, journal) = testing::fake_client(vec![testing::Canned::server_error("/podmonitors")]);
+        let result = reconcile_monitoring(&client, &gateway(), &output, Some(&config)).await;
+        assert!(
+            result.is_err(),
+            "missing or failing required CRD must fail enabled reconciliation"
+        );
+        assert!(
+            journal
+                .requests()
+                .iter()
+                .all(|request| !request.uri.contains("/networkpolicies")),
+            "do not isolate pods before PodMonitor can be installed"
+        );
     }
 }

@@ -12,6 +12,9 @@ The format follows [Keep a Changelog], and this project adheres to
 
 ### Added
 
+- Opt-in PodMonitor generation and metrics ingress policy with ownership-checked
+  cleanup when monitoring is disabled or no usable listeners remain.
+
 - A five-second preStop delay for data-plane pods so Service endpoints can
   be removed before the proxy stops accepting connections.
 

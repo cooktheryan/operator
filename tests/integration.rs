@@ -1836,10 +1836,10 @@ async fn retry_http_get(client: &reqwest::Client, url: &str, timeout_secs: u64) 
 // installing it, and disabled mode again to cover stale-resource cleanup.
 #[cfg(test)]
 mod monitoring_tests {
-    use k8s_openapi::api::networking::v1::NetworkPolicy;
+    use k8s_openapi::api::{core::v1::Pod, networking::v1::NetworkPolicy};
     use kube::{
         ResourceExt as _,
-        api::{DynamicObject, Patch, PatchParams},
+        api::{DynamicObject, ListParams, Patch, PatchParams},
     };
     use praxis_operator::resources::monitoring::{
         MonitoringConfig, build_metrics_network_policy, build_pod_monitor, monitoring_config, pod_monitor_api_resource,

@@ -337,6 +337,13 @@ pub(super) async fn apply_child_resources(
 }
 
 /// Applies enabled monitoring or removes only this Gateway's stale monitoring.
+///
+/// The ingress policy is applied before the `PodMonitor` is published.
+/// Publishing the scrape target first would let Prometheus discover it
+/// while the policy that scopes metrics access is still unapplied; a
+/// rejected policy then leaves the target advertised with no settled
+/// reachability. The policy alone is harmless: the data ports stay open
+/// to every peer, only the metrics port is narrowed.
 async fn reconcile_monitoring(
     client: &kube::Client,
     gw: &Gateway,
@@ -348,10 +355,10 @@ async fn reconcile_monitoring(
     };
     let ns = gw.namespace().unwrap_or_default();
     let child = child_name(&gw.name_any());
-    let monitor = build_pod_monitor(&child, &ns, gw)?;
-    super::gateway::apply_dynamic_resource(client, &ns, &monitor, &pod_monitor_api_resource()).await?;
     let policy = build_metrics_network_policy(&child, &ns, gw, config, &config_output.listener_ports)?;
-    super::gateway::apply_resource(client, &ns, &policy).await
+    super::gateway::apply_resource(client, &ns, &policy).await?;
+    let monitor = build_pod_monitor(&child, &ns, gw)?;
+    super::gateway::apply_dynamic_resource(client, &ns, &monitor, &pod_monitor_api_resource()).await
 }
 
 /// Converts `(name, port)` pairs into Kubernetes `ServicePort` entries.
@@ -858,18 +865,31 @@ mod tests {
                 "disabled monitoring must look for stale owned resources: {kind}"
             );
         }
-        let (client, journal) = testing::fake_client(vec![testing::Canned::server_error("/podmonitors")]);
+        let (client, journal) = testing::fake_client(vec![
+            testing::Canned::ok(
+                "/networkpolicies",
+                serde_json::json!({"apiVersion":"networking.k8s.io/v1", "kind":"NetworkPolicy"}),
+            ),
+            testing::Canned::server_error("/podmonitors"),
+        ]);
         let result = reconcile_monitoring(&client, &gateway(), &output, Some(&config)).await;
         assert!(
             result.is_err(),
             "missing or failing required CRD must fail enabled reconciliation"
         );
+        let requests = journal.requests();
+        let policy = requests
+            .iter()
+            .position(|request| request.uri.contains("/networkpolicies"))
+            .expect("the ingress policy is applied even when the PodMonitor cannot be");
+        let monitor = requests
+            .iter()
+            .position(|request| request.uri.contains("/podmonitors"))
+            .expect("the PodMonitor is still attempted");
         assert!(
-            journal
-                .requests()
-                .iter()
-                .all(|request| !request.uri.contains("/networkpolicies")),
-            "do not isolate pods before PodMonitor can be installed"
+            policy < monitor,
+            "the policy has to exist before Prometheus can discover the target, or a rejected \
+             policy leaves a published scrape target with unsettled reachability"
         );
     }
 }

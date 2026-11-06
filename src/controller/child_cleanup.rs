@@ -24,25 +24,49 @@ use crate::{
 };
 
 /// Removes only children controlled by this Gateway, tolerating prior deletion.
+///
+/// Every kind is attempted even when an earlier deletion fails: a
+/// transient error on one resource must not strand the rest until a
+/// later retry happens to succeed. The first failure is still returned,
+/// so reconciliation keeps retrying until every child is gone.
 pub(super) async fn delete_children(client: &kube::Client, gw: &Gateway) -> Result<()> {
     let namespace = gw.namespace().unwrap_or_default();
     let name = child_name(&gw.name_any());
     let owner_uid = gw.uid().ok_or(OperatorError::MissingObjectKey(".metadata.uid"))?;
-    delete_owned::<Service>(client, &namespace, &name, &owner_uid).await?;
-    Box::pin(delete_owned::<Deployment>(client, &namespace, &name, &owner_uid)).await?;
-    delete_owned::<ConfigMap>(client, &namespace, &name, &owner_uid).await?;
-    delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await?;
-    delete_monitoring_children(client, gw).await
+    let data_plane = [
+        delete_owned::<Service>(client, &namespace, &name, &owner_uid).await,
+        Box::pin(delete_owned::<Deployment>(client, &namespace, &name, &owner_uid)).await,
+        delete_owned::<ConfigMap>(client, &namespace, &name, &owner_uid).await,
+        delete_owned::<PodDisruptionBudget>(client, &namespace, &name, &owner_uid).await,
+    ];
+    let monitoring = delete_monitoring_children(client, gw).await;
+
+    first_error(data_plane.into_iter().chain([monitoring]))
 }
 
 /// Removes monitoring resources regardless of the current enablement setting.
+///
+/// Both kinds are attempted even when the first one fails, for the same
+/// reason [`delete_children`] does not stop early.
 pub(super) async fn delete_monitoring_children(client: &kube::Client, gw: &Gateway) -> Result<()> {
     let namespace = gw.namespace().unwrap_or_default();
     let name = child_name(&gw.name_any());
     let owner_uid = gw.uid().ok_or(OperatorError::MissingObjectKey(".metadata.uid"))?;
-    delete_owned::<NetworkPolicy>(client, &namespace, &name, &owner_uid).await?;
     let monitors = Api::<DynamicObject>::namespaced_with(client.clone(), &namespace, &pod_monitor_api_resource());
-    delete_from_api(&monitors, &name, &owner_uid).await
+    let deletions = [
+        delete_owned::<NetworkPolicy>(client, &namespace, &name, &owner_uid).await,
+        delete_from_api(&monitors, &name, &owner_uid).await,
+    ];
+
+    first_error(deletions)
+}
+
+/// Returns the first failure from a batch whose entries all ran already.
+fn first_error(results: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    results
+        .into_iter()
+        .find_map(std::result::Result::err)
+        .map_or(Ok(()), Err)
 }
 
 /// Checks controller ownership and guards deletion against concurrent replacement.
@@ -166,6 +190,36 @@ mod tests {
             "cleanup failures must be retried instead of reporting stale resources removed"
         );
     }
+    #[tokio::test]
+    /// One failing kind does not stop the others from being reclaimed.
+    async fn cleanup_attempts_every_kind_after_a_failure() {
+        let (ctx, journal) = testing::fake_context(
+            vec![testing::Canned::server_error("/services/praxis-gw")],
+            testing::Cached::default(),
+        );
+        let gateway: Gateway = serde_json::from_value(serde_json::json!({"metadata":{"name":"gw","namespace":"infra","uid":"gateway-uid"},"spec":{"gatewayClassName":"praxis","listeners":[]}})).unwrap();
+
+        assert!(
+            delete_children(&ctx.client, &gateway).await.is_err(),
+            "a failed deletion must still reach error_policy, or the stale child is never retried"
+        );
+        for kind in [
+            "/deployments/praxis-gw",
+            "/configmaps/praxis-gw",
+            "/poddisruptionbudgets/praxis-gw",
+            "/networkpolicies/praxis-gw",
+            "/podmonitors/praxis-gw",
+        ] {
+            assert!(
+                journal
+                    .requests()
+                    .iter()
+                    .any(|request| request.method == "GET" && request.uri.contains(kind)),
+                "a failure on one kind must not strand the rest until a retry happens to succeed: {kind}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,

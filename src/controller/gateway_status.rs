@@ -156,15 +156,18 @@ async fn build_listener_statuses(
     let mut any_rejected = false;
 
     for listener in listeners {
-        if let Some(reason) = conflicts.get(&listener.name) {
-            any_rejected = true;
-            statuses.push(conflicted_listener_status(listener, generation, *reason));
-            continue;
-        }
-
+        // The reserved port is checked first: it is why the listener cannot
+        // bind at all, and reporting a conflict between two listeners that
+        // both ask for it would bury the actionable reason.
         if let Some(status) = rejected_listener_status(listener, generation) {
             any_rejected = true;
             statuses.push(status);
+            continue;
+        }
+
+        if let Some(reason) = conflicts.get(&listener.name) {
+            any_rejected = true;
+            statuses.push(conflicted_listener_status(listener, generation, *reason));
             continue;
         }
 
@@ -182,18 +185,17 @@ fn rejected_listener_status(listener: &GatewayListeners, generation: i64) -> Opt
     if !ListenerProtocol::is_supported(&listener.protocol) {
         return Some(unsupported_listener_status(listener, generation));
     }
-    (listener.port == ADMIN_PORT).then(|| ListenerStatus {
-        name: listener.name.clone(),
-        attached_routes: 0,
-        supported_kinds: vec![],
-        conditions: vec![
-            conditions::not_accepted(
-                generation,
-                "PortUnavailable",
-                "port 9902 is reserved for health and metrics",
-            ),
-            conditions::not_programmed(generation, "Invalid", "port 9902 is reserved for health and metrics"),
-        ],
+    (listener.port == ADMIN_PORT).then(|| {
+        let message = format!("port {ADMIN_PORT} is reserved for health and metrics");
+        ListenerStatus {
+            name: listener.name.clone(),
+            attached_routes: 0,
+            supported_kinds: vec![],
+            conditions: vec![
+                conditions::not_accepted(generation, "PortUnavailable", &message),
+                conditions::not_programmed(generation, "Invalid", &message),
+            ],
+        }
     })
 }
 
@@ -556,6 +558,42 @@ mod tests {
             Some("True"),
             "one valid listener keeps the Gateway accepted"
         );
+    }
+
+    #[tokio::test]
+    async fn listeners_sharing_the_reserved_port_report_the_reservation_not_a_conflict() {
+        let (ctx, journal) = testing::fake_context(vec![gateway_response()], testing::Cached::default());
+        let mut first = http_listener();
+        first.port = ADMIN_PORT;
+        let mut second = first.clone();
+        second.name = "reserved-2".to_owned();
+
+        build_and_apply_gateway_status(&ctx, &gateway(), &[first, second], &[])
+            .await
+            .expect("a reachable API server accepts the patch");
+
+        let status = patched_status(&journal);
+        let listeners = status
+            .pointer("/listeners")
+            .and_then(Value::as_array)
+            .expect("both reserved listeners need a status entry");
+        assert_eq!(listeners.len(), 2, "every declared listener is reported");
+        for listener in listeners {
+            assert_eq!(
+                listener.pointer("/conditions/0/reason").and_then(Value::as_str),
+                Some("PortUnavailable"),
+                "the reservation is why neither listener can bind, and a generic conflict hides it"
+            );
+            let conflicted = listener
+                .pointer("/conditions")
+                .and_then(Value::as_array)
+                .is_some_and(|conditions| conditions.iter().any(|condition| condition["type"] == "Conflicted"));
+            assert!(
+                !conflicted,
+                "the reserved port is the reason both listeners are rejected, not a conflict \
+                 between them"
+            );
+        }
     }
 
     #[tokio::test]

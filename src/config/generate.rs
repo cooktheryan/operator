@@ -104,8 +104,33 @@ fn build_filter_chain(
     listener_hostnames: &std::collections::HashMap<String, Option<String>>,
 ) -> yaml_serde::Result<PraxisFilterChain> {
     let name = &listener.name;
+    let scoped = scoped_routes(routes, &listener.merged_section_names, listener_hostnames);
+    let scoped_refs: Vec<_> = scoped.iter().collect();
 
-    let section_names = &listener.merged_section_names;
+    let mut filters = vec![PraxisFilterEntry {
+        filter: "request_id".to_owned(),
+        config: yaml_serde::Value::Null,
+    }];
+    if scoped_refs.is_empty() {
+        return routeless_chain(name, filters);
+    }
+    filters.extend_from_slice(&route_filters.terminating);
+    filters.push(build_router_filter(&scoped_refs)?);
+    filters.extend_from_slice(&route_filters.transforming);
+    filters.push(build_lb_filter(clusters)?);
+
+    Ok(PraxisFilterChain {
+        name: format!("{name}-chain"),
+        filters,
+    })
+}
+
+/// Selects and orders the routes that target one listener.
+fn scoped_routes(
+    routes: &[PraxisRoute],
+    section_names: &[String],
+    listener_hostnames: &std::collections::HashMap<String, Option<String>>,
+) -> Vec<PraxisRoute> {
     let filtered: Vec<_> = routes
         .iter()
         .filter(|route| {
@@ -119,17 +144,18 @@ fn build_filter_chain(
         .collect();
     let mut scoped = inject_listener_hostnames(&filtered, listener_hostnames);
     sort_routes_by_specificity_owned(&mut scoped);
-    let scoped_refs: Vec<_> = scoped.iter().collect();
+    scoped
+}
 
-    let mut filters = vec![PraxisFilterEntry {
-        filter: "request_id".to_owned(),
-        config: yaml_serde::Value::Null,
-    }];
-    filters.extend_from_slice(&route_filters.terminating);
-    filters.push(build_router_filter(&scoped_refs)?);
-    filters.extend_from_slice(&route_filters.transforming);
-    filters.push(build_lb_filter(clusters)?);
-
+/// Terminates a listener that has no routes with a 404 response.
+///
+/// Praxis rejects an empty router route list, so a routeless listener needs a
+/// terminating filter instead of a router.
+fn routeless_chain(name: &str, mut filters: Vec<PraxisFilterEntry>) -> yaml_serde::Result<PraxisFilterChain> {
+    filters.push(PraxisFilterEntry {
+        filter: "static_response".to_owned(),
+        config: yaml_serde::to_value(serde_json::json!({"status": 404, "body": "no route"}))?,
+    });
     Ok(PraxisFilterChain {
         name: format!("{name}-chain"),
         filters,
@@ -542,10 +568,17 @@ mod tests {
         let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
 
         let chain = &config.filter_chains[0];
-        let lb_config = &chain.filters[2].config;
-        let clusters_value = lb_config.get("clusters").expect("lb config should have clusters key");
-        let clusters_seq = clusters_value.as_sequence().expect("clusters should be a sequence");
-        assert!(clusters_seq.is_empty(), "clusters should be empty");
+        let names: Vec<_> = chain.filters.iter().map(|filter| filter.filter.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["request_id", "static_response"],
+            "a routeless listener must terminate with a static response"
+        );
+        assert_eq!(
+            chain.filters[1].config.get("body"),
+            Some(&yaml_serde::Value::String("no route".to_owned())),
+            "a routeless listener must answer with the no-route response"
+        );
     }
 
     #[test]
@@ -628,9 +661,29 @@ mod tests {
             tls: None,
         };
 
-        let config = assemble_config(vec![listener], &[], &[], &RouteFilters::default(), &Default::default()).unwrap();
+        let route = PraxisRoute {
+            path: None,
+            path_prefix: "/".to_owned(),
+            host: None,
+            headers: None,
+            cluster: "default~svc~80".to_owned(),
+            listener_names: vec![],
+        };
+        let cluster = build_cluster("default~svc~80", vec!["10.0.0.1:80".to_owned()], None);
+        let config = assemble_config(
+            vec![listener],
+            &[route],
+            &[cluster],
+            &RouteFilters::default(),
+            &Default::default(),
+        )
+        .unwrap();
 
-        let router = &config.filter_chains[0].filters[1];
+        let router = config.filter_chains[0]
+            .filters
+            .iter()
+            .find(|filter| filter.filter == "router")
+            .expect("a routed listener has a router");
         assert_eq!(
             router.config.get("multi_level_subdomain_matching"),
             Some(&yaml_serde::Value::Bool(true)),
@@ -666,7 +719,23 @@ mod tests {
             transforming: vec![headers],
         };
 
-        let config = assemble_config(vec![listener], &[], &[], &route_filters, &Default::default()).unwrap();
+        let route = PraxisRoute {
+            path: None,
+            path_prefix: "/".to_owned(),
+            host: None,
+            headers: None,
+            cluster: "default~svc~80".to_owned(),
+            listener_names: vec![],
+        };
+        let cluster = build_cluster("default~svc~80", vec!["10.0.0.1:80".to_owned()], None);
+        let config = assemble_config(
+            vec![listener],
+            &[route],
+            &[cluster],
+            &route_filters,
+            &Default::default(),
+        )
+        .unwrap();
 
         let chain = &config.filter_chains[0];
         let names: Vec<_> = chain.filters.iter().map(|f| f.filter.as_str()).collect();

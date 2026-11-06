@@ -89,10 +89,7 @@ pub(super) fn collect_routes<'route>(
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
 
-    let listeners: Vec<_> = praxis_config::usable_listeners(&gw.spec.listeners)
-        .into_iter()
-        .cloned()
-        .collect();
+    let listeners = praxis_config::usable_listeners(&gw.spec.listeners);
     let attached = attachment::attached_routes(&name, &ns, &listeners, all_routes);
     namespace_filter::filter_routes_by_allowed_namespaces(&attached, &listeners, &ns, stores)
 }

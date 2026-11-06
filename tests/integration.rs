@@ -1867,22 +1867,7 @@ mod monitoring_tests {
         let policies = Api::<NetworkPolicy>::namespaced(ctx.client.clone(), &ns);
         let monitors = Api::<DynamicObject>::namespaced_with(ctx.client.clone(), &ns, &pod_monitor_api_resource());
         if let Some(config) = config {
-            let (policy, monitor) = await_monitoring_present(&policies, &monitors, &child).await;
-            assert_eq!(
-                policy,
-                build_metrics_network_policy(&child, &ns, &gw, &config, &[("http".to_owned(), 8080)])
-                    .map(|mut expected| {
-                        expected.metadata = policy.metadata.clone();
-                        expected
-                    })
-                    .unwrap(),
-                "the API stores the intended policy"
-            );
-            assert_eq!(
-                monitor.data,
-                build_pod_monitor(&child, &ns, &gw).unwrap().data,
-                "the API stores the intended monitor spec"
-            );
+            assert_monitoring_matches(&policies, &monitors, &child, &ns, &gw, &config).await;
             let pods = Api::<Pod>::namespaced(ctx.client.clone(), &ns)
                 .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={name}")))
                 .await
@@ -1918,7 +1903,7 @@ mod monitoring_tests {
                 )
                 .await
                 .unwrap();
-            await_monitoring_present(&policies, &monitors, &child).await;
+            assert_monitoring_matches(&policies, &monitors, &child, &ns, &gw, &config).await;
         } else {
             let crds = Api::<
                 k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
@@ -1993,6 +1978,26 @@ mod monitoring_tests {
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
+    }
+
+    /// Waits for both monitoring resources and checks their stored contents.
+    async fn assert_monitoring_matches(
+        policies: &Api<NetworkPolicy>,
+        monitors: &Api<DynamicObject>,
+        child: &str,
+        ns: &str,
+        gw: &Gateway,
+        config: &MonitoringConfig,
+    ) {
+        let (policy, monitor) = await_monitoring_present(policies, monitors, child).await;
+        let mut expected = build_metrics_network_policy(child, ns, gw, config, &[("http".to_owned(), 8080)]).unwrap();
+        expected.metadata = policy.metadata.clone();
+        assert_eq!(policy, expected, "the API stores the intended policy");
+        assert_eq!(
+            monitor.data,
+            build_pod_monitor(child, ns, gw).unwrap().data,
+            "the API stores the intended monitor spec"
+        );
     }
 
     async fn monitor_is_absent(monitors: &Api<DynamicObject>, name: &str) -> bool {

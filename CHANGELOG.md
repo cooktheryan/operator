@@ -32,6 +32,8 @@ The format follows [Keep a Changelog], and this project adheres to
   `PortUnavailable` without blocking other valid listeners.
 - Generated data-plane configuration now targets Praxis 0.7.5 so health and
   metrics bind to the dedicated admin endpoint.
+- Gateway listeners without routes now answer HTTP 404 with a static response
+  instead of generating an empty router chain.
 
 - Status writes no longer restamp unchanged conditions, which had kept
   the operator in a permanent reconcile loop.

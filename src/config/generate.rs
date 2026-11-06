@@ -30,9 +30,6 @@ pub struct PraxisConfig {
     /// Filter chains with routing and processing filters.
     pub filter_chains: Vec<PraxisFilterChain>,
 
-    /// Insecure options for container deployments.
-    pub insecure_options: PraxisInsecureOptions,
-
     /// Listeners (proxy entry points).
     pub listeners: Vec<PraxisListener>,
 }
@@ -40,8 +37,8 @@ pub struct PraxisConfig {
 /// Admin endpoint configuration.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PraxisAdmin {
-    /// Admin bind address.
-    pub address: String,
+    /// Health and metrics bind address.
+    pub metrics_address: String,
 }
 
 /// Named filter chain.
@@ -52,13 +49,6 @@ pub struct PraxisFilterChain {
 
     /// Ordered filters in the chain.
     pub filters: Vec<PraxisFilterEntry>,
-}
-
-/// Insecure options (for container deployments).
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct PraxisInsecureOptions {
-    /// Allow admin endpoint on public interface.
-    pub allow_public_admin: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -88,12 +78,9 @@ pub fn assemble_config(
 
     Ok(PraxisConfig {
         admin: PraxisAdmin {
-            address: "0.0.0.0:9901".to_owned(),
+            metrics_address: "0.0.0.0:9902".to_owned(),
         },
         filter_chains,
-        insecure_options: PraxisInsecureOptions {
-            allow_public_admin: true,
-        },
         listeners,
     })
 }
@@ -342,12 +329,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.admin.address, "0.0.0.0:9901", "admin address should be set");
-        assert_eq!(config.listeners.len(), 1, "should have one listener");
-        assert!(
-            config.insecure_options.allow_public_admin,
-            "allow_public_admin should be true"
+        assert_eq!(
+            config.admin.metrics_address, "0.0.0.0:9902",
+            "health and metrics should bind to the dedicated metrics address"
         );
+        assert_eq!(config.listeners.len(), 1, "should have one listener");
 
         assert_eq!(config.filter_chains.len(), 1, "should have one filter chain");
         let chain = &config.filter_chains[0];
@@ -405,15 +391,14 @@ mod tests {
         let yaml = yaml_serde::to_string(&config).expect("config should serialize to YAML");
 
         assert!(yaml.contains("admin:"), "YAML should contain admin section");
-        assert!(yaml.contains("0.0.0.0:9901"), "YAML should contain admin address");
+        assert!(
+            yaml.contains("metrics_address: 0.0.0.0:9902"),
+            "YAML should contain metrics address"
+        );
         assert!(yaml.contains("listeners:"), "YAML should contain listeners section");
         assert!(
             yaml.contains("filter_chains:"),
             "YAML should contain filter_chains section"
-        );
-        assert!(
-            yaml.contains("insecure_options:"),
-            "YAML should contain insecure_options section"
         );
         assert!(yaml.contains("request_id"), "YAML should contain request_id filter");
         assert!(yaml.contains("router"), "YAML should contain router filter");

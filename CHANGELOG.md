@@ -12,6 +12,9 @@ The format follows [Keep a Changelog], and this project adheres to
 
 ### Added
 
+- Opt-in PodMonitor generation and metrics ingress policy with ownership-checked
+  cleanup when monitoring is disabled or no usable listeners remain.
+
 - Health, readiness and metrics endpoints on port 8080, with matching
   probes on the operator Deployment.
 - Leader election over a coordination `Lease`, so the operator can run
@@ -24,6 +27,11 @@ The format follows [Keep a Changelog], and this project adheres to
 - Listener protocol and hostname conflict detection.
 
 ### Fixed
+
+- Gateway listeners on the reserved health/metrics port 9902 now report
+  `PortUnavailable` without blocking other valid listeners.
+- Generated data-plane configuration now targets Praxis 0.7.5 so health and
+  metrics bind to the dedicated admin endpoint.
 
 - Status writes no longer restamp unchanged conditions, which had kept
   the operator in a permanent reconcile loop.

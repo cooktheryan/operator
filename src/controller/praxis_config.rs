@@ -29,6 +29,7 @@ use crate::{
         routing::{BackendRef, PraxisRoute, convert_routes, rule_has_authorized_backend},
         weights::{ResolvedBackend, distribute_service_weights, sort_service_endpoints},
     },
+    context::ADMIN_PORT,
     endpoints,
     error::Result,
     gateway_api::{attachment::AttachedRoute, listener_conflict, protocol::ListenerProtocol},
@@ -37,6 +38,10 @@ use crate::{
         deployment::{DeploymentParams, build_deployment},
         disruption::build_pod_disruption_budget,
         labels::child_name,
+        monitoring::{
+            MonitoringConfig, build_metrics_network_policy, build_pod_monitor, monitoring_config,
+            pod_monitor_api_resource,
+        },
         service::build_service,
     },
 };
@@ -72,12 +77,7 @@ pub(super) async fn build_praxis_config(
     attached: &[AttachedRoute<'_>],
     grants: &[ReferenceGrant],
 ) -> Result<PraxisConfigOutput> {
-    let conflicts = listener_conflict::detect_conflicts(listeners);
-    let supported: Vec<_> = listeners
-        .iter()
-        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
-        .filter(|listener| !conflicts.contains_key(&listener.name))
-        .collect();
+    let supported = usable_listeners(listeners);
 
     let listener_hostnames = build_listener_hostname_map(&supported);
     let praxis_listeners = merge_listeners_by_port(&supported);
@@ -97,6 +97,17 @@ pub(super) async fn build_praxis_config(
         listener_ports: collect_listener_ports(&supported),
         tls_secret_names: collect_tls_secret_names(&supported),
     })
+}
+
+/// Selects supported, unreserved listeners that have no binding conflicts.
+pub(super) fn usable_listeners(listeners: &[GatewayListeners]) -> Vec<&GatewayListeners> {
+    let conflicts = listener_conflict::detect_conflicts(listeners);
+    listeners
+        .iter()
+        .filter(|listener| ListenerProtocol::is_supported(&listener.protocol))
+        .filter(|listener| listener.port != ADMIN_PORT)
+        .filter(|listener| !conflicts.contains_key(&listener.name))
+        .collect()
 }
 
 /// Merges Gateway listeners on the same port into a single Praxis
@@ -295,6 +306,7 @@ pub(super) async fn apply_child_resources(
     gw: &Gateway,
     config_output: &PraxisConfigOutput,
 ) -> Result<String> {
+    let monitoring = monitoring_config()?;
     let ns = gw.namespace().unwrap_or_default();
     let name = gw.name_any();
     let child = child_name(&name);
@@ -320,7 +332,26 @@ pub(super) async fn apply_child_resources(
     let budget = build_pod_disruption_budget(&child, &ns, gw)?;
     super::gateway::apply_resource(client, &ns, &budget).await?;
 
+    reconcile_monitoring(client, gw, config_output, monitoring.as_ref()).await?;
     Ok(config_hash)
+}
+
+/// Applies enabled monitoring or removes only this Gateway's stale monitoring.
+async fn reconcile_monitoring(
+    client: &kube::Client,
+    gw: &Gateway,
+    config_output: &PraxisConfigOutput,
+    monitoring: Option<&MonitoringConfig>,
+) -> Result<()> {
+    let Some(config) = monitoring else {
+        return super::child_cleanup::delete_monitoring_children(client, gw).await;
+    };
+    let ns = gw.namespace().unwrap_or_default();
+    let child = child_name(&gw.name_any());
+    let monitor = build_pod_monitor(&child, &ns, gw)?;
+    super::gateway::apply_dynamic_resource(client, &ns, &monitor, &pod_monitor_api_resource()).await?;
+    let policy = build_metrics_network_policy(&child, &ns, gw, config, &config_output.listener_ports)?;
+    super::gateway::apply_resource(client, &ns, &policy).await
 }
 
 /// Converts `(name, port)` pairs into Kubernetes `ServicePort` entries.
@@ -630,6 +661,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Builds a plain HTTP listener on port 80.
+    /// Builds the generated-config output a reconciliation step receives.
+    fn test_config_output(
+        config_yaml: &str,
+        listener_ports: Vec<(String, i32)>,
+        tls_secret_names: Vec<String>,
+    ) -> PraxisConfigOutput {
+        PraxisConfigOutput {
+            config_yaml: config_yaml.to_owned(),
+            listener_ports,
+            tls_secret_names,
+        }
+    }
+
     fn http_listener() -> GatewayListeners {
         GatewayListeners {
             name: "http".to_owned(),
@@ -716,5 +760,116 @@ mod tests {
                 }],
             }),
         )
+    }
+    /// Supported listeners without conflicts are selectable, even next to bad ones.
+    #[test]
+    fn usable_listeners_exclude_conflicts_and_preserve_a_valid_sibling() {
+        let http = http_listener();
+        let mut https = http.clone();
+        https.name = "https".to_owned();
+        https.protocol = "HTTPS".to_owned();
+        assert!(
+            usable_listeners(&[http.clone(), https.clone()]).is_empty(),
+            "a protocol-conflicting pair contributes no usable listeners"
+        );
+        let mut valid = http.clone();
+        valid.name = "valid".to_owned();
+        valid.port = 8085;
+        let listeners = [http, https, valid];
+        let selected: Vec<_> = usable_listeners(&listeners)
+            .into_iter()
+            .map(|listener| listener.name.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["valid"],
+            "conflicting listeners must not remove an independent listener"
+        );
+    }
+
+    /// The reserved metrics port never becomes a listener or Service port.
+    #[tokio::test]
+    async fn reserved_metrics_port_is_excluded_without_discarding_other_listeners() {
+        let (client, _) = testing::fake_client(vec![]);
+        let valid = http_listener();
+        let mut reserved = valid.clone();
+        reserved.name = "reserved".to_owned();
+        reserved.port = ADMIN_PORT;
+        let output = build_praxis_config(&client, &[valid, reserved], &[], &[])
+            .await
+            .expect("the valid listener must still generate configuration");
+        assert_eq!(
+            output.listener_ports,
+            vec![("http".to_owned(), 80)],
+            "the metrics port must not become a proxy listener or Service port"
+        );
+        let yaml: yaml_serde::Value = yaml_serde::from_str(&output.config_yaml).expect("generated YAML");
+        assert_eq!(
+            yaml.get("listeners")
+                .and_then(yaml_serde::Value::as_sequence)
+                .map(Vec::len),
+            Some(1),
+            "only the valid proxy listener may be configured"
+        );
+    }
+
+    /// Enabled monitoring applies both resources; disabled monitoring cleans up.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "explicit monitoring fixtures cover policy and reconciliation contracts"
+    )]
+    async fn monitoring_apply_and_disabled_cleanup_use_real_reconciliation_paths() {
+        let output = test_config_output("listeners: []", vec![("http".to_owned(), 8080)], vec![]);
+        let (client, journal) = testing::fake_client(vec![
+            testing::Canned::ok(
+                "/networkpolicies",
+                serde_json::json!({"apiVersion":"networking.k8s.io/v1", "kind":"NetworkPolicy"}),
+            ),
+            testing::Canned::ok(
+                "/podmonitors",
+                serde_json::json!({"apiVersion":"monitoring.coreos.com/v1", "kind":"PodMonitor"}),
+            ),
+        ]);
+        let config = MonitoringConfig {
+            namespace: "monitoring".to_owned(),
+            pod_selector: BTreeMap::from([("app".to_owned(), "prometheus".to_owned())]),
+        };
+        reconcile_monitoring(&client, &gateway(), &output, Some(&config))
+            .await
+            .unwrap();
+        assert_eq!(
+            journal
+                .requests()
+                .iter()
+                .filter(|request| request.method == "PATCH")
+                .count(),
+            2,
+            "both enabled resources must be applied"
+        );
+        let (client, journal) = testing::fake_client(vec![]);
+        reconcile_monitoring(&client, &gateway(), &output, None).await.unwrap();
+        for kind in ["/networkpolicies/", "/podmonitors/"] {
+            assert!(
+                journal
+                    .requests()
+                    .iter()
+                    .any(|request| request.method == "GET" && request.uri.contains(kind)),
+                "disabled monitoring must look for stale owned resources: {kind}"
+            );
+        }
+        let (client, journal) = testing::fake_client(vec![testing::Canned::server_error("/podmonitors")]);
+        let result = reconcile_monitoring(&client, &gateway(), &output, Some(&config)).await;
+        assert!(
+            result.is_err(),
+            "missing or failing required CRD must fail enabled reconciliation"
+        );
+        assert!(
+            journal
+                .requests()
+                .iter()
+                .all(|request| !request.uri.contains("/networkpolicies")),
+            "do not isolate pods before PodMonitor can be installed"
+        );
     }
 }
